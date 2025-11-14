@@ -38,6 +38,8 @@ data_module:
     use_town13: True
 
     use_safety_flag: True
+    # Filter dreamer evaluation by mode (null = all modes, or 'crash', 'lane_change', 'faster', 'slower', 'stop', 'target_speed')
+    filter_dreamer_mode: null
 
 max_epochs: 15
 val_every_n_epochs: 2

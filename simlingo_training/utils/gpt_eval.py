@@ -2,11 +2,11 @@ import openai
 from retry import retry
 
 def initialize_client():
-    openai.api_key = "ADD_YOUR_KEY_HERE"  # Replace with your OpenAI API key
+    openai.api_key = "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"  # Replace with your OpenAI API key
     return openai
 
 @retry(tries=5, delay=1, backoff=1, jitter=(0, 5), max_delay=10)
-def call_chatgpt(client, chatgpt_messages, max_tokens=40, model="gpt-4o-2024-08-06"): 
+def call_chatgpt(client, chatgpt_messages, max_tokens=40, model="gpt-5-mini"): 
     response = client.chat.completions.create(
         model=model, messages=chatgpt_messages, temperature=0.6, max_tokens=max_tokens
     )

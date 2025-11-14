@@ -11,6 +11,7 @@ from transformers import AutoProcessor, AutoTokenizer
 
 from simlingo_training.config import TrainConfig
 from simlingo_training.utils.logging_project import setup_logging
+from simlingo_training.callbacks import IncrementalPredictionWriter
 # from simlingo_training.callbacks.visualise import VisualiseCallback
 
 @hydra.main(config_path=f"config", config_name="config", version_base="1.1")
@@ -19,13 +20,18 @@ def main(cfg: TrainConfig):
     torch.set_float32_matmul_precision("high")
     pl.seed_everything(42)
     
+    # TEST MODE: Set to True for quick testing with 10 samples
+    # Set to False for full evaluation run
+    TEST_MODE = True  # <--- CHANGE THIS TO False FOR FULL RUN; True for testing
+    
     # eval_mode = "QA"
     # eval_mode = "commentary"
-    eval_mode = "Dreaming"
+    # eval_mode = "Dreaming"
+    eval_mode = "crash"  # Uses ambiguous crash dataset with same eval as Dreaming
 
     qa_dataset = cfg.data_module.qa_dataset
     insteval_dataset = cfg.data_module.insteval_dataset
-    load_path = '/YOUR_PATH/outputs/simlingo/checkpoints/epoch=013.ckpt'
+    load_path = '/home/ubuntu/simlingo/outputs/finetuned/checkpoints/last.ckpt'
     if load_path is not None:
         load_path_config = Path(load_path).parent.parent / '.hydra/config.yaml'
         cfg = OmegaConf.load(load_path_config)
@@ -33,21 +39,34 @@ def main(cfg: TrainConfig):
     cfg.data_module.qa_dataset = qa_dataset
     cfg.data_module.insteval_dataset = insteval_dataset
     cfg.gpus = 1
-    cfg.data_module.num_workers = 8
+    cfg.data_module.num_workers = 4
+    
     cfg.data_module.batch_size = 64
 
+    if TEST_MODE:
+        print("="*60)
+        print("⚠️  TEST MODE ENABLED - Running on 64 samples only")
+        print("   Set TEST_MODE=False in eval.py for full evaluation")
+        print("="*60)
+    
     print(f'Eval mode: {eval_mode}')
     print(f'Checkpoint: {load_path}')
     print(f"Using {cfg.gpus} GPUs")
+    print(f'Batch size: {cfg.data_module.batch_size}')
     
     if eval_mode == "QA" or eval_mode == "commentary":
         cfg.data_module.dreamer_dataset = None
         cfg.data_module.driving_dataset = None
         cfg.data_module.insteval_dataset = None 
-    elif eval_mode == "Dreaming":
+    elif eval_mode == "Dreaming" or eval_mode == "crash":
         cfg.data_module.dreamer_dataset = None
         cfg.data_module.driving_dataset = None
         cfg.data_module.qa_dataset = None
+        
+        # For crash mode, use ambiguous crash subfolder within same dataset
+        if eval_mode == "crash":
+            cfg.data_module.base_dataset.dreamer_folder = "ambiguous_crash"
+            print(f"Using crash dreamer folder: {cfg.data_module.base_dataset.dreamer_folder}")
     
     if eval_mode == "QA":
         cfg.data_module.base_dataset.use_commentary = False
@@ -55,8 +74,12 @@ def main(cfg: TrainConfig):
     elif eval_mode == "commentary":
         cfg.data_module.base_dataset.use_commentary = True
         cfg.data_module.base_dataset.use_qa = False
-    elif eval_mode == "Dreaming":
-        cfg.data_module.base_dataset.use_safety_flag = True
+    elif eval_mode == "Dreaming" or eval_mode == "crash":
+        # cfg.data_module.base_dataset.use_safety_flag = True
+        cfg.data_module.base_dataset.use_safety_flag = False
+
+    print(f'Use safety flag: {cfg.data_module.base_dataset.use_safety_flag}')
+    
     
     # disable image augmentation
     cfg.data_module.base_dataset.img_augmentation = False
@@ -125,6 +148,13 @@ def main(cfg: TrainConfig):
     print(f"Number of GPUS: {cfg.gpus}")
     overfit = 0
     
+    # Add prediction writer callback to save predictions incrementally
+    prediction_writer = IncrementalPredictionWriter()
+    
+    # Configure prediction limit based on TEST_MODE
+    # With batch_size=10 and limit=1, we get exactly 10 samples for testing
+    limit_batches = 100 if TEST_MODE else None
+    
     if cfg.gpus >= 1:
         trainer = Trainer(
             accelerator="gpu",
@@ -139,6 +169,8 @@ def main(cfg: TrainConfig):
             max_epochs=cfg.max_epochs,
             overfit_batches=overfit,
             check_val_every_n_epoch=cfg.val_every_n_epochs,
+            callbacks=[prediction_writer],
+            limit_predict_batches=limit_batches,  # NEW: Limit batches for testing
         )
 
     if load_path is not None:

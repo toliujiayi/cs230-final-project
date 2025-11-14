@@ -33,10 +33,13 @@ class evaluation_suit():
         return scores
 
     def eval_chatGPT(self, data):
-        with Pool(16) as p:  # Change the number based on your CPU cores
-            scores_all = p.map(gpt_forward, data)
+        pool = Pool(16)  # Change the number based on your CPU cores
+        try:
+            scores_all = pool.map(gpt_forward, data)
+        finally:
+            pool.close()
+            pool.join()
         
-
         scores = [x for x in scores_all if x != -1]
         delted = len(scores_all) - len(scores)
         print(f"Deleted {delted} invalid samples")
@@ -102,12 +105,13 @@ class evaluation_suit():
         except:
             print("Error in accuracy evaluation")
             scores["accuracy"] = 0.0
-        try:
-            print("chatGPT evaluation")
-            scores["chatgpt"] = self.eval_chatGPT(self.GPT)
-        except:
-            print("Error in chatGPT evaluation")
-            scores["chatgpt"] = 0.0
+        # try:
+        #     print("chatGPT evaluation")
+        #     scores["chatgpt"] = self.eval_chatGPT(self.GPT)
+        # except:
+        #     print("Error in chatGPT evaluation")
+        #     scores["chatgpt"] = 0.0
+        scores["chatgpt"] = 0.0
         try:
             print("language evaluation")
             scores["language"] = self.eval_language()
@@ -142,8 +146,20 @@ if __name__ == '__main__':
     print("accuracy score: ", output["accuracy"])
     print("chatgpt score: ", output["chatgpt"])
     print("language score: ", output["language"])
+
+    print("DEBUG: About to print full output...")
+    print(output)
+    print("DEBUG: Finished printing output")
     
     # save the evaluation results
+    print("DEBUG: Calculating save path...")
     save_path = args.root_path1.replace(".json", "_metrics_gpt-4o-2024-08-06.json")
+    print(f"DEBUG: Save path is: {save_path}")
+    print("DEBUG: Opening file for writing...")
     with open(save_path, 'w') as f:
+        print("DEBUG: Writing JSON...")
         json.dump(output, f, indent=4)
+    print("DEBUG: File saved successfully!")
+    
+    # Explicitly exit to ensure the script terminates
+    sys.exit(0)

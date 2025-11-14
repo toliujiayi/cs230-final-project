@@ -27,6 +27,9 @@ class Eval_Dreamer(BaseDataset):  # pylint: disable=locally-disabled, invalid-na
             **cfg,
         ):
         super().__init__(dreamer=True, **cfg)
+        # Set default for filter_dreamer_mode if not provided in config
+        if not hasattr(self, 'filter_dreamer_mode'):
+            self.filter_dreamer_mode = None
 
     def __getitem__(self, index):
         """Returns the item at index idx. """
@@ -56,7 +59,8 @@ class Eval_Dreamer(BaseDataset):  # pylint: disable=locally-disabled, invalid-na
             else:
                 activate_safety = False
         else:
-            activate_safety = None
+            # activate_safety = None
+            activate_safety = True  # Default to SAFETY mode (reject unsafe trajectories)
 
         augment_sample = False
         aug_rotation = 0.0
@@ -90,7 +94,18 @@ class Eval_Dreamer(BaseDataset):  # pylint: disable=locally-disabled, invalid-na
             if 'factor' in key:
                 continue
             
-            options.extend(option)
+            # Apply mode filter if specified (note: initialization already ensures at least one option exists)
+            if self.filter_dreamer_mode is not None:
+                # Filter options by the specified mode
+                filtered_option = [opt for opt in option if opt['mode'] == self.filter_dreamer_mode]
+                options.extend(filtered_option)
+            else:
+                # Original behavior: include all options
+                options.extend(option)
+        
+        # If filter_dreamer_mode is set, initialization guarantees options exist
+        # If not set, there should always be options. Assert to catch bugs.
+        assert len(options) > 0, f"No options found for sample {index}"
 
         chosen_option = random.choice(options)
 
@@ -189,6 +204,7 @@ class Eval_Dreamer(BaseDataset):  # pylint: disable=locally-disabled, invalid-na
         eval_infos = {
             'mode': chosen_option['mode'],
             'allowed': chosen_option['allowed'],
+            'safe_to_execute': chosen_option['safe_to_execute'],
             'org_wps': data['waypoints_org'],
             'org_wps_1d': data["waypoints_1d"],
             'org_path': data['route_adjusted_org'],

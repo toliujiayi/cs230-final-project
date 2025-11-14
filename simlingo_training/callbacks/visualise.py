@@ -94,12 +94,12 @@ class VisualiseCallback(Callback):
             return
 
         print("Validation visualization!")
-        with torch.cuda.amp.autocast(enabled=True):
-            # Forward with sampling
-            # waypoints, route, target_speed, language = pl_module.forward(batch, return_language=True)
-            speed_wps, route, language = pl_module.forward(batch, return_language=True)
-
         try:
+            with torch.cuda.amp.autocast(enabled=True):
+                # Forward with sampling
+                # waypoints, route, target_speed, language = pl_module.forward(batch, return_language=True)
+                speed_wps, route, language = pl_module.forward(batch, return_language=True)
+
             self._visualise_training_examples(batch, speed_wps, trainer, pl_module, 'val_waypoints')
             self._visualise_training_examples(batch, route, trainer, pl_module, 'val_route')
             # visualise_cameras(batch, pl_module, trainer, language, route, speed_wps, name='val_imgs')
@@ -107,9 +107,9 @@ class VisualiseCallback(Callback):
             print("visualised_val_example")
             # _LOGGER.info("visualised_training_example")
         except Exception as e:  # pylint: disable=broad-except
-            print("visualise_training_examples", e)
-        #     pass
-            # _LOGGER.exception("visualise_training_examples", e)
+            print(f"WARNING: Validation visualization failed: {e}")
+            print("Continuing training without validation visualization...")
+        
         if hasattr(pl_module, "clear_cache"):
             print("clearing_cache")
             # Clear cache associated with decoding language model
@@ -129,15 +129,20 @@ class VisualiseCallback(Callback):
         if trainer.global_step % self.interval != 0:
             return
 
-        with torch.cuda.amp.autocast(enabled=True):
-            # Forward with sampling
-            speed_wps, route, language = pl_module.forward(batch, return_language=True)
+        try:
+            with torch.cuda.amp.autocast(enabled=True):
+                # Forward with sampling
+                speed_wps, route, language = pl_module.forward(batch, return_language=True)
 
-        self._visualise_training_examples(batch, speed_wps, trainer, pl_module, 'waypoints', language_pred=language)
-        self._visualise_training_examples(batch, route, trainer, pl_module, 'route', language_pred=language)
-        # visualise_cameras(batch, pl_module, trainer, language, route, speed_wps, name='imgs')
-    
-        print("visualised_training_example")
+            self._visualise_training_examples(batch, speed_wps, trainer, pl_module, 'waypoints', language_pred=language)
+            self._visualise_training_examples(batch, route, trainer, pl_module, 'route', language_pred=language)
+            # visualise_cameras(batch, pl_module, trainer, language, route, speed_wps, name='imgs')
+        
+            print("visualised_training_example")
+        except Exception as e:
+            print(f"WARNING: Visualization failed at step {trainer.global_step}: {e}")
+            print("Continuing training without visualization...")
+        
         if hasattr(pl_module, "clear_cache"):
             print("clearing_cache")
             pl_module.clear_cache()
@@ -155,14 +160,16 @@ class VisualiseCallback(Callback):
         if not pl_module.logger:
             return
 
-        if 'waypoints' in name:
-            waypoint_vis, prompt_img = visualise_waypoints(batch, waypoints, language_pred=language_pred)
-        elif 'route' in name:
-            waypoint_vis, prompt_img = visualise_waypoints(batch, waypoints, language_pred=language_pred, route=True)
-        pl_module.logger.log_image(
-            f"visualise/{name}", images=[Image.fromarray(waypoint_vis), prompt_img], step=trainer.global_step
-        )
-        plt.close("all")
+        try:
+            if 'waypoints' in name:
+                waypoint_vis, prompt_img = visualise_waypoints(batch, waypoints, language_pred=language_pred)
+            elif 'route' in name:
+                waypoint_vis, prompt_img = visualise_waypoints(batch, waypoints, language_pred=language_pred, route=True)
+            pl_module.logger.log_image(
+                f"visualise/{name}", images=[Image.fromarray(waypoint_vis), prompt_img], step=trainer.global_step
+            )
+        finally:
+            plt.close("all")
 
 
 def fig_to_np(fig):
@@ -217,9 +224,15 @@ def visualise_waypoints(batch: DrivingExample, waypoints, route=False, language_
             lines_wrap = len(textwrap.wrap(wrapped_text, width=80))
             lines_wrap_pred = len(textwrap.wrap(wrapped_pred_text, width=80))
         
-            white_draw.text((10, y_curr), f'{i} GT: {wrapped_text}', fill="black", font=ImageFont.truetype(f"{repo_root}/simlingo_training/arial.ttf", 20))
+            # Try to load custom font, fallback to default if not available
+            try:
+                font = ImageFont.truetype(f"{repo_root}/simlingo_training/arial.ttf", 20)
+            except (OSError, IOError):
+                font = ImageFont.load_default()
+            
+            white_draw.text((10, y_curr), f'{i} GT: {wrapped_text}', fill="black", font=font)
             y_curr += 20*lines_wrap
-            white_draw.text((10, y_curr), f'{i} Pred: {wrapped_pred_text}', fill="black", font=ImageFont.truetype(f"{repo_root}/simlingo_training/arial.ttf", 20))
+            white_draw.text((10, y_curr), f'{i} Pred: {wrapped_pred_text}', fill="black", font=font)
             y_curr += 20*lines_wrap_pred + 20
         ax = fig.add_subplot(rows, cols, i + 1)
         # Predicted waypoints

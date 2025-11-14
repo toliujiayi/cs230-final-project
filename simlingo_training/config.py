@@ -67,6 +67,8 @@ class DatasetBaseConfig:
     img_shift_augmentation_prob: float = 0.5
     
     use_safety_flag: bool = False
+    filter_dreamer_mode: Optional[str] = None  # Filter dreamer eval by mode (None=all, or 'crash', 'lane_change', etc.)
+    dreamer_folder: str = 'dreamer'  # Folder containing dreamer data (default: 'dreamer', or 'ambiguous_crash' for crash finetuning)
     
     num_route_points: int = 20
 

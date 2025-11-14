@@ -47,7 +47,9 @@ class BaseDataset(Dataset):  # pylint: disable=locally-disabled, invalid-name
         filter_infractions_per_route = True
 
         self.rgb_folder = 'rgb'
-        self.dreamer_folder = 'dreamer'
+        # Only set default if not provided in cfg
+        if not hasattr(self, 'dreamer_folder'):
+            self.dreamer_folder = 'dreamer'
         
         self.images = []
         self.boxes = []
@@ -61,6 +63,7 @@ class BaseDataset(Dataset):  # pylint: disable=locally-disabled, invalid-name
         total_routes = 0
         perfect_routes = 0
         crashed_routes = 0
+        filtered_by_mode = 0
 
         fail_reasons = {}
 
@@ -286,9 +289,36 @@ class BaseDataset(Dataset):  # pylint: disable=locally-disabled, invalid-name
                     continue
                 
                 if dreamer:
-                    dreamer_file_path = measurement_file.replace('measurements', f'{self.dreamer_folder}').replace('data/', f'{self.dreamer_folder}/')
+                    # Replace file folder (measurements -> dreamer) and root folder (data/ -> dreamer_folder/)
+                    dreamer_file_path = measurement_file.replace('measurements', 'dreamer').replace('data/', f'{self.dreamer_folder}/')
                     if not os.path.exists(dreamer_file_path):
                         continue
+                    
+                    # Pre-filter by mode if filter_dreamer_mode is specified
+                    if hasattr(self, 'filter_dreamer_mode') and self.filter_dreamer_mode is not None:
+                        try:
+                            with gzip.open(dreamer_file_path, 'rt') as f1:
+                                alternative_trajectories_data = ujson.load(f1)
+                            
+                            # Check if any options have the specified mode
+                            has_mode = False
+                            for key, option in alternative_trajectories_data.items():
+                                if 'factor' in key:
+                                    continue
+                                for opt in option:
+                                    if opt.get('mode') == self.filter_dreamer_mode:
+                                        has_mode = True
+                                        break
+                                if has_mode:
+                                    break
+                            
+                            # Skip this sample if it doesn't have the specified mode
+                            if not has_mode:
+                                filtered_by_mode += 1
+                                continue
+                        except Exception as e:
+                            # If we can't read the file, skip it
+                            continue
                  
                 if self.bucket_name is not None and self.bucket_name != "all":
                     measurement_file_path = Path(measurement_file)
@@ -350,6 +380,8 @@ class BaseDataset(Dataset):  # pylint: disable=locally-disabled, invalid-name
         print('Crashed routes:', crashed_routes)
         print('Perfect routes:', perfect_routes)
         print('Fail reasons:', fail_reasons)
+        if dreamer and hasattr(self, 'filter_dreamer_mode') and self.filter_dreamer_mode is not None:
+            print(f'Filtered by mode ({self.filter_dreamer_mode}):', filtered_by_mode)
 
     def __len__(self):
         """Returns the length of the dataset. """

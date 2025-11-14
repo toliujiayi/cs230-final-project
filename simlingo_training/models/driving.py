@@ -283,6 +283,10 @@ class DrivingModel(pl.LightningModule):
         return {"loss": output.loss, "outputs": output}
 
     def predict_step(self, batch: DrivingExample, _batch_idx: int = 0):
+        """
+        Predict step that returns data for incremental writing to disk.
+        Returns tuple of predictions that will be written by IncrementalPredictionWriter callback.
+        """
         run_ids = decode_uint8(batch.run_id)
         
         speed_wps, route, language = self.forward(batch, return_language=True)
@@ -294,38 +298,20 @@ class DrivingModel(pl.LightningModule):
         route_equal = torch.tensor(route_equal)
         route = route_equal.to(route.device)
         
-        
         route_gt = batch.driving_label.path
         speed_wps_gt = batch.driving_label.waypoints
         language_gt = batch.driving_label.answer.language_string
+        prompts = batch.driving_input.prompt.language_string
+        qa_templates = batch.qa_templates
+        eval_infos = batch.driving_label.eval_infos
         
-        if len(self.prediction) == 0:
-            self.prediction = {
-                "waypoints": [speed_wps],
-                "route": [route],
-                "language": language,
-                "waypoints_gt": [speed_wps_gt],
-                "route_gt": [route_gt],
-                "language_gt": language_gt,
-                "prompt": batch.driving_input.prompt.language_string,
-                "path": run_ids,
-                "qa_templates": batch.qa_templates,
-                "eval_infos": batch.driving_label.eval_infos,
-            }
-        else:
-            self.prediction["waypoints"].append(speed_wps)
-            self.prediction["route"].append(route)
-            self.prediction["language"].extend(language)
-            self.prediction["waypoints_gt"].append(speed_wps_gt)
-            self.prediction["route_gt"].append(route_gt)
-            self.prediction["language_gt"].extend(language_gt)
-            self.prediction["prompt"].extend(batch.driving_input.prompt.language_string)
-            self.prediction["path"].extend(run_ids)
-            self.prediction["qa_templates"].extend(batch.qa_templates)
-            self.prediction["eval_infos"].extend(batch.driving_label.eval_infos)
-            
-        
-        return speed_wps, route, language, speed_wps_gt, route_gt, language_gt
+        # Return tuple for IncrementalPredictionWriter callback to write to disk
+        # This avoids accumulating all predictions in memory
+        return (
+            speed_wps, route, language,
+            speed_wps_gt, route_gt, language_gt,
+            run_ids, qa_templates, eval_infos, prompts
+        )
 
     def equal_spacing_route(self, points):
         route = np.concatenate((np.zeros_like(points[:1]),  points)) # Add 0 to front
@@ -341,18 +327,20 @@ class DrivingModel(pl.LightningModule):
 
         return interp_points
 
-    def on_predict_epoch_end(self) -> None:    
-
-        repo_path = get_original_cwd()
-
-        if self.trainer.ckpt_path is not None:
-            ckpt_path = Path(self.trainer.ckpt_path).parent.parent
-        else:
-            ckpt_path = Path(f'{repo_path}/outputs/{self.language_model.variant}')
-        save_prediction_path = ckpt_path / "predictions"
-        save_prediction_path.mkdir(exist_ok=True, parents=True)
+    def on_predict_epoch_end(self) -> None:
+        """
+        This method is now deprecated. Predictions are written incrementally to disk
+        using the IncrementalPredictionWriter callback to avoid memory issues.
         
-        samples_cot = [i for i, l in enumerate(self.prediction["prompt"]) if "What should the ego do next?" in l]
+        The old implementation accumulated all predictions in self.prediction dict,
+        which caused out-of-memory errors on large datasets.
+        
+        See IncrementalPredictionWriter callback for the new implementation.
+        """
+        # All prediction writing is now handled by IncrementalPredictionWriter callback
+        return
+        
+        # OLD IMPLEMENTATION BELOW (not executed - kept for reference)
         samples_qa = [i for i, l in enumerate(self.prediction["prompt"]) if "Q:" in l]
         samples_all = [i for i in range(len(self.prediction["prompt"]))]
         language = [(l, l_gt, p) for l, l_gt, p in zip(self.prediction["language"], self.prediction["language_gt"], self.prediction["path"])]
@@ -726,7 +714,23 @@ class DrivingModel(pl.LightningModule):
             max_steps = self.trainer.estimated_stepping_batches
         else:
             max_steps = self.trainer.max_steps
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer, max_lr=self.lr, total_steps=max_steps, pct_start=self.pct_start, verbose=False
-        )
+        
+        # Safety check: ensure max_steps is valid (> 0) to avoid division by zero in scheduler
+        if max_steps <= 0:
+            print(f"ERROR: max_steps = {max_steps}, this will cause OneCycleLR to fail!")
+            print(f"Trainer info: max_epochs={self.trainer.max_epochs}, limit_train_batches={self.trainer.limit_train_batches}")
+            raise ValueError(f"Invalid max_steps={max_steps}. Cannot initialize OneCycleLR scheduler.")
+        
+        # For very small training runs (< 100 steps), OneCycleLR with small pct_start can fail
+        # Use constant LR instead to avoid division by zero in scheduler phases
+        if max_steps < 100:
+            print(f"WARNING: Small training run ({max_steps} steps). Using constant LR instead of OneCycleLR to avoid scheduler issues.")
+            scheduler = torch.optim.lr_scheduler.ConstantLR(
+                optimizer, factor=1.0, total_iters=max_steps
+            )
+        else:
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                optimizer, max_lr=self.lr, total_steps=max_steps, pct_start=self.pct_start, verbose=False
+            )
+        
         return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "frequency": 1, "interval": "step"}}

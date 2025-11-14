@@ -59,7 +59,7 @@ def get_entry_point():
 
 
 DEBUG = False # saves images during evaluation
-HD_VIZ = False
+HD_VIZ = False  # Set to True for higher resolution visualization (1920x1080 instead of default)
 USE_UKF = True
 
 class LingoAgent(autonomous_agent.AutonomousAgent):
@@ -864,7 +864,8 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
 
         del self.model
         del self.config
-        if self.cfg.data_module.encoder == 'llavanext':
+        # Clean up processor if it exists
+        if hasattr(self, 'processor'):
             del self.processor
 
 
