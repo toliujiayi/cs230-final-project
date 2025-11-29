@@ -21,6 +21,7 @@ from simlingo_training.utils.custom_types import (DrivingExample, DrivingInput,
                                                 DrivingLabel, DrivingOutput,
                                                 TrainingOutput)
 
+from safety_head import SafetyHead
 
 pprint = PrettyPrinter().pprint
 
@@ -100,6 +101,12 @@ class DrivingModel(pl.LightningModule):
         else:
             self.tokenizer = self.processor
 
+        # Safety / executability head
+        self.safety_head = SafetyHead(
+            d_model=self.language_model.hidden_size,
+            hidden_dim=256,
+            num_classes=2,
+        )
 
     def forward(self,
         example: DrivingExample,
@@ -183,6 +190,9 @@ class DrivingModel(pl.LightningModule):
             for k, v in predictions.items():
                 if v is not None:
                     setattr(self, k, v)
+
+        # Only compute safety logits for Dreamer data, need to add require condition.
+        safety_logits = self.safety_head(features)
 
         return self.speed_wps, self.route, self.language
 
