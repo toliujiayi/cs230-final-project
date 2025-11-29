@@ -22,6 +22,7 @@ from simlingo_training.utils.custom_types import (DrivingExample, DrivingInput,
                                                 TrainingOutput)
 
 from safety_head import SafetyHead
+import torch.nn.functional as F
 
 pprint = PrettyPrinter().pprint
 
@@ -191,9 +192,6 @@ class DrivingModel(pl.LightningModule):
                 if v is not None:
                     setattr(self, k, v)
 
-        # Only compute safety logits for Dreamer data, need to add require condition.
-        safety_logits = self.safety_head(features)
-
         return self.speed_wps, self.route, self.language
 
 
@@ -261,6 +259,48 @@ class DrivingModel(pl.LightningModule):
         adaptor_features, adaptor_logits = self.forward_model(example.driving_input, adaptor_dict, driving_labels=example.driving_label)
         loss_dict = self.adaptors.compute_loss(adaptor_features, adaptor_logits, adaptor_dict, example)
 
+        # --- NEW: Safety / executability head (Dreamer) ---
+        # Only run if Dreamer provides a binary label, e.g. example.driving_label.safe_to_execute
+        eval_infos = getattr(example.driving_label, "eval_infos", None)
+
+        if eval_infos is not None:
+            B = adaptor_features.size(0)
+            if len(eval_infos) == B:
+                outputs_by_adaptor = self.adaptors.split_outputs_by_adaptor(
+                    adaptor_dict,
+                    (adaptor_features, adaptor_logits),
+                )
+                driving_features, driving_logits = outputs_by_adaptor["driving"]
+
+                safety_input = driving_features.mean(dim=1)
+                safety_logits = self.safety_head(safety_input)
+
+                safety_labels_list = []
+                for info in eval_infos:
+                    if "safe_to_execute" not in info:
+                        continue
+                    v = info["safe_to_execute"]
+
+                    if isinstance(v, bool):
+                        v = 1 if v else 0
+                    elif isinstance(v, str):
+                        v = 1 if v.lower() in ("safe", "allowed", "yes", "true", "1") else 0
+                    else:
+                        v = int(v)
+
+                    safety_labels_list.append(v)
+
+                if len(safety_labels_list) == B:
+                    safety_labels = torch.tensor(
+                        safety_labels_list,
+                        device=safety_logits.device,
+                        dtype=torch.long,
+                    )
+                    safety_loss = F.cross_entropy(safety_logits, safety_labels)
+                    loss_dict["safety_loss"] = safety_loss
+
+        # --- End safety head block ---
+
         loss_dict_only_losses = {k:v for k, v in loss_dict.items() if k.endswith("loss")}
         loss_logs = {k:v for k, v in loss_dict.items() if k.endswith("log")}
         
@@ -298,29 +338,76 @@ class DrivingModel(pl.LightningModule):
         Returns tuple of predictions that will be written by IncrementalPredictionWriter callback.
         """
         run_ids = decode_uint8(batch.run_id)
-        
+
+        # 1) Get generative predictions (language + driving) using existing pipeline
         speed_wps, route, language = self.forward(batch, return_language=True)
 
+        # 2) Equal-spacing for route as before
         self.num_route_points = 20
         route_equal = []
         for i in range(len(route)):
             route_equal.append(self.equal_spacing_route(route[i].cpu()))
         route_equal = torch.tensor(route_equal)
         route = route_equal.to(route.device)
-        
+
+        # 3) Ground-truth labels and metadata
         route_gt = batch.driving_label.path
         speed_wps_gt = batch.driving_label.waypoints
         language_gt = batch.driving_label.answer.language_string
         prompts = batch.driving_input.prompt.language_string
         qa_templates = batch.qa_templates
-        eval_infos = batch.driving_label.eval_infos
-        
-        # Return tuple for IncrementalPredictionWriter callback to write to disk
-        # This avoids accumulating all predictions in memory
+        eval_infos = batch.driving_label.eval_infos  # list of dicts
+
+        # ------------------------------------------------------------
+        # 4) NEW: compute safety probabilities and attach to eval_infos
+        # ------------------------------------------------------------
+        eval_infos_aug = eval_infos
+        try:
+            with torch.no_grad():
+                # Use teacher-forced pipeline, as in forward_loss
+                adaptor_dict_pred = self.adaptors(batch)
+                adaptor_features_pred, adaptor_logits_pred = self.forward_model(
+                    batch.driving_input,
+                    adaptor_dict_pred,
+                    driving_labels=batch.driving_label,
+                )
+                outputs_by_adaptor_pred = self.adaptors.split_outputs_by_adaptor(
+                    adaptor_dict_pred,
+                    (adaptor_features_pred, adaptor_logits_pred),
+                )
+                driving_features_pred, driving_logits_pred = outputs_by_adaptor_pred["driving"]
+
+                # Pool over driving tokens -> (B, D)
+                safety_input_pred = driving_features_pred.mean(dim=1)  # (B, D)
+
+                # Safety logits and probabilities (B, 2)
+                safety_logits_pred = self.safety_head(safety_input_pred)
+                safety_probs_pred = torch.softmax(safety_logits_pred, dim=-1)[:, 1]  # P(safe)
+
+                safety_probs_list = safety_probs_pred.detach().cpu().tolist()
+
+                # Create augmented eval_infos, don’t mutate in-place if you prefer
+                eval_infos_aug = []
+                for info, p in zip(eval_infos, safety_probs_list):
+                    info_new = dict(info)
+                    info_new["safety_prob_model"] = float(p)  # probability sample is safe
+                    info_new["safety_pred_model"] = bool(p >= 0.5)  # predicted label
+                    eval_infos_aug.append(info_new)
+
+        except Exception as e:
+            # Optional: print or log, but don't break prediction if something goes wrong
+            print(f"[predict_step] Warning: failed to compute safety predictions: {e}")
+            eval_infos_aug = eval_infos
+        # ------------------------------------------------------------
+        # End safety prediction block
+        # ------------------------------------------------------------
+
+        # 5) Return tuple for IncrementalPredictionWriter callback to write to disk
+        #    Note: we return eval_infos_aug instead of original eval_infos
         return (
             speed_wps, route, language,
             speed_wps_gt, route_gt, language_gt,
-            run_ids, qa_templates, eval_infos, prompts
+            run_ids, qa_templates, eval_infos_aug, prompts
         )
 
     def equal_spacing_route(self, points):
