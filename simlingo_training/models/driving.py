@@ -21,7 +21,7 @@ from simlingo_training.utils.custom_types import (DrivingExample, DrivingInput,
                                                 DrivingLabel, DrivingOutput,
                                                 TrainingOutput)
 
-from safety_head import SafetyHead
+from simlingo_training.models.safety_head import SafetyHead
 import torch.nn.functional as F
 
 pprint = PrettyPrinter().pprint
