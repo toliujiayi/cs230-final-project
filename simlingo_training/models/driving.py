@@ -4,7 +4,7 @@ import os
 import random
 from pathlib import Path
 from pprint import PrettyPrinter
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Optional, Tuple, List, Any
 
 import hydra
 import numpy as np
@@ -59,6 +59,8 @@ class DrivingModel(pl.LightningModule):
         
         self.cfg_data_module = cfg_data_module
         
+        self.loss_weights = cfg.get("loss_weights", {})
+
         self.vision_model = hydra.utils.instantiate(
             self.vision_model,
             cfg_data_module=cfg_data_module,
@@ -81,6 +83,8 @@ class DrivingModel(pl.LightningModule):
             self.language_model.hidden_size, 
             speed_wps_mode=self.speed_wps_mode,
             predict_route_as_wps=self.predict_route_as_wps,
+            use_contrastive=getattr(self, 'use_contrastive', False),
+            use_consistency=getattr(self, 'use_consistency', False),
         )
 
         self.adaptors = AdaptorList(
@@ -110,6 +114,7 @@ class DrivingModel(pl.LightningModule):
         Samples a trajectory from the model.
         """
         self.speed_wps, self.route, self.language = None, None, []
+        self.safety_prob = None  # Initialize safety_prob for contrastive mode
         try:
             driving_input = example.driving_input
         except AttributeError:
@@ -159,7 +164,17 @@ class DrivingModel(pl.LightningModule):
 
                 driving_features = features[:, -len_driving:]
                 driving_logits = logits[:, -len_driving:]
-                predictions = self.adaptors.driving.get_predictions(driving_features, driving_logits)
+                
+                # Ensure features are in the correct dtype (might be float32 due to norm, but model heads are half)
+                # This fixes RuntimeError: expected mat1 and mat2 to have the same dtype, but got: float != c10::Half
+                driving_features = driving_features.to(logits.dtype)
+
+                is_safety_mode = None
+                if driving_input.prompt is not None and driving_input.prompt.language_string is not None:
+                    prompts = driving_input.prompt.language_string
+                    is_safety_mode = torch.tensor(['<SAFETY>' in p for p in prompts], device=driving_features.device).bool()
+
+                predictions = self.adaptors.driving.get_predictions(driving_features, driving_logits, is_safety_mode=is_safety_mode)
                     
                 for k, v in predictions.items():
                     if v is not None:
@@ -184,7 +199,7 @@ class DrivingModel(pl.LightningModule):
                 if v is not None:
                     setattr(self, k, v)
 
-        return self.speed_wps, self.route, self.language
+        return self.speed_wps, self.route, self.language, self.safety_prob
 
 
     def forward_model(self, 
@@ -230,6 +245,10 @@ class DrivingModel(pl.LightningModule):
         vision_logits, adaptor_logits = logits.split(
             [logits.size(1) - adaptor_embeds.size(1), adaptor_embeds.size(1)], dim=1
         )
+        
+        # Ensure features match logits dtype (logits are typically half precision in mixed precision training)
+        adaptor_features = adaptor_features.to(adaptor_logits.dtype)
+        
         return adaptor_features, adaptor_logits
     
 
@@ -258,7 +277,7 @@ class DrivingModel(pl.LightningModule):
         if per_sample:
             return loss_dict_only_losses, pred_labels
 
-        return summarise_losses(loss_dict_only_losses), loss_logs
+        return summarise_losses(loss_dict_only_losses, weights=self.loss_weights), loss_logs
 
     def training_step(self, batch: DrivingExample, _batch_idx: int = 0):
         output, loss_logs = self.forward_loss(batch)
@@ -289,7 +308,7 @@ class DrivingModel(pl.LightningModule):
         """
         run_ids = decode_uint8(batch.run_id)
         
-        speed_wps, route, language = self.forward(batch, return_language=True)
+        speed_wps, route, language, safety_prob = self.forward(batch, return_language=True)
 
         self.num_route_points = 20
         route_equal = []
@@ -305,12 +324,16 @@ class DrivingModel(pl.LightningModule):
         qa_templates = batch.qa_templates
         eval_infos = batch.driving_label.eval_infos
         
+        # Get safety ground truth if available
+        safe_to_execute_gt = getattr(batch.driving_label, 'safe_to_execute', None)
+        
         # Return tuple for IncrementalPredictionWriter callback to write to disk
         # This avoids accumulating all predictions in memory
         return (
             speed_wps, route, language,
             speed_wps_gt, route_gt, language_gt,
-            run_ids, qa_templates, eval_infos, prompts
+            run_ids, qa_templates, eval_infos, prompts,
+            safety_prob, safe_to_execute_gt  # NEW: safety predictions and ground truth
         )
 
     def equal_spacing_route(self, points):
@@ -703,10 +726,95 @@ class DrivingModel(pl.LightningModule):
             self.log(log_key, v, batch_size=counts[k], sync_dist=True, add_dataloader_idx=False)
 
 
+    def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        """
+        Callback when loading checkpoint. Used to handle loading state dict with missing keys
+        when we add new modules (like contrastive heads) that are not in the checkpoint.
+        """
+        if 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+            # Get current model keys
+            model_keys = set(self.state_dict().keys())
+            ckpt_keys = set(state_dict.keys())
+            
+            # Check for missing keys (new modules)
+            missing_keys = model_keys - ckpt_keys
+            if len(missing_keys) > 0:
+                print(f"WARNING: Missing keys in checkpoint: {missing_keys}")
+                print("Proceeding with strict=False loading for these keys.")
+                # We can't change strict=False here directly for the main load, 
+                # but PL calls load_state_dict internally.
+                # However, if we manually load here, we might interfere.
+                # Better approach: This hook is called BEFORE load_state_dict.
+                # We can modify the checkpoint? No.
+                # Actually, PL calls `on_load_checkpoint` then `load_state_dict`.
+                # If we want to support partial loading, we should override `load_state_dict`?
+                # No, standard PL doesn't make this easy in the hook.
+                # But we can catch the error in `eval.py` or `train.py`.
+                # Alternatively, we can use a custom loading function.
+                pass
+
+    def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        pass
+
     def configure_optimizers(self):
+        
+        # Separate parameters into groups with different learning rates
+        # New heads (randomly initialized) need higher LR
+        # Pretrained/finetuned components need lower LR
+        
+        params_new_heads = []      # contrastive_head, safety_gate (random init)
+        params_pretrained_heads = []  # route_head, speed_wps_head, wp_encoder (pretrained)
+        params_language_model = []    # LoRA adapters (finetuning)
+        params_other = []
+        
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+            
+            # New randomly initialized heads - need higher LR
+            if 'contrastive_head' in name or 'safety_gate' in name:
+                params_new_heads.append(param)
+            # Pretrained driving heads
+            elif 'adaptors.driving' in name:
+                params_pretrained_heads.append(param)
+            # Language model (LoRA) - finetuning
+            elif 'language_model' in name:
+                params_language_model.append(param)
+            # Other (wp_encoder, etc.)
+            else:
+                params_other.append(param)
+
+        # Define learning rate multipliers
+        # Base LR from config (e.g., 3e-5)
+        lr_new_heads = self.lr * 3.0       # 3x for new randomly initialized modules
+        lr_pretrained = self.lr            # 1x for pretrained heads  
+        lr_language = self.lr * 0.5        # 0.5x for LoRA (already regularized)
+        lr_other = self.lr                 # 1x for other modules
+        
+        # Log the learning rates
+        print(f"Learning rates:")
+        print(f"  - New heads (contrastive, gate): {lr_new_heads:.2e}")
+        print(f"  - Pretrained heads (route, speed): {lr_pretrained:.2e}")
+        print(f"  - Language model (LoRA): {lr_language:.2e}")
+        print(f"  - Other: {lr_other:.2e}")
+
+        param_groups = [
+            {'params': params_new_heads, 'lr': lr_new_heads, 'name': 'new_heads'},
+            {'params': params_pretrained_heads, 'lr': lr_pretrained, 'name': 'pretrained_heads'},
+            {'params': params_language_model, 'lr': lr_language, 'name': 'language_model'},
+            {'params': params_other, 'lr': lr_other, 'name': 'other'},
+        ]
+
+        # Filter out empty groups and log sizes
+        param_groups = [g for g in param_groups if len(g['params']) > 0]
+        for g in param_groups:
+            n_params = sum(p.numel() for p in g['params'])
+            print(f"  - {g['name']}: {len(g['params'])} tensors, {n_params:,} params, lr={g['lr']:.2e}")
+
         optimizer = AdamW(
-            self.parameters(),
-            lr=self.lr,
+            param_groups,
+            lr=self.lr,  # Default LR (used if group doesn't specify)
             weight_decay=self.weight_decay,
             betas=self.betas,
         )
@@ -717,9 +825,15 @@ class DrivingModel(pl.LightningModule):
         
         # Safety check: ensure max_steps is valid (> 0) to avoid division by zero in scheduler
         if max_steps <= 0:
-            print(f"ERROR: max_steps = {max_steps}, this will cause OneCycleLR to fail!")
-            print(f"Trainer info: max_epochs={self.trainer.max_epochs}, limit_train_batches={self.trainer.limit_train_batches}")
-            raise ValueError(f"Invalid max_steps={max_steps}. Cannot initialize OneCycleLR scheduler.")
+            # If max_steps is not set correctly (e.g. infinite training), default to a large number or 1 epoch
+            print(f"WARNING: max_steps = {max_steps}. Using estimated steps from limit_train_batches or max_epochs.")
+            # Recalculate if possible
+            if self.trainer.limit_train_batches and isinstance(self.trainer.limit_train_batches, int):
+                max_steps = self.trainer.limit_train_batches * self.trainer.max_epochs
+            else:
+                 # Fallback
+                 max_steps = 1000
+            print(f"New max_steps: {max_steps}")
         
         # For very small training runs (< 100 steps), OneCycleLR with small pct_start can fail
         # Use constant LR instead to avoid division by zero in scheduler phases

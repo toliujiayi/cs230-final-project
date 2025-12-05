@@ -37,6 +37,10 @@ class DrivingModelConfig:
     speed_wps_mode: str = '2d'
     predict_route_as_wps: bool = True
 
+    use_contrastive: bool = False
+    use_consistency: bool = False
+    loss_weights: Dict[str, float] = field(default_factory=dict)
+
     _target_: str = "simlingo_training.models.driving.DrivingModel"
 
 

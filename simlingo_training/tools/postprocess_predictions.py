@@ -80,6 +80,7 @@ def calculate_metrics(prediction_dir: Path, rank: int = 0) -> Dict:
     routes_file = prediction_dir / f"routes_rank_{rank}.jsonl"
     language_file = prediction_dir / f"language_rank_{rank}.jsonl"
     metadata_file = prediction_dir / f"metadata_rank_{rank}.jsonl"
+    safety_file = prediction_dir / f"safety_rank_{rank}.jsonl"  # NEW: safety predictions
     
     # Check if all required files exist
     for f in [waypoints_file, routes_file, language_file, metadata_file]:
@@ -91,6 +92,12 @@ def calculate_metrics(prediction_dir: Path, rank: int = 0) -> Dict:
     routes_data = load_jsonl(routes_file)
     language_data = load_jsonl(language_file)
     metadata_data = load_jsonl(metadata_file)
+    
+    # Load safety data if available (for contrastive learning evaluation)
+    safety_data = None
+    if safety_file.exists():
+        print("Loading safety predictions for gate accuracy evaluation...")
+        safety_data = load_jsonl(safety_file)
     
     num_samples = len(waypoints_data)
     print(f"Loaded {num_samples} samples")
@@ -475,6 +482,68 @@ def calculate_metrics(prediction_dir: Path, rank: int = 0) -> Dict:
         ade_route = np.mean(np.linalg.norm(route_preds_sample - route_gt_sample, axis=-1), axis=-1)
         ade_fde[f"ade_to_gt_{name}"] = float(np.mean(ade_route))
         ade_fde[f"num_samples_{name}"] = int(len(ade_route))
+    
+    # ========================================
+    # GATE ACCURACY (Contrastive Learning Evaluation)
+    # ========================================
+    if safety_data is not None:
+        print("\nCalculating gate accuracy metrics...")
+        
+        safety_probs = []
+        safety_gts = []
+        
+        for item in safety_data:
+            prob = item.get('safety_prob')
+            gt = item.get('safe_to_execute_gt')
+            
+            if prob is not None and gt is not None:
+                safety_probs.append(prob)
+                safety_gts.append(gt)
+        
+        if len(safety_probs) > 0:
+            safety_probs = np.array(safety_probs)
+            safety_gts = np.array(safety_gts, dtype=bool)
+            
+            # Binary predictions (threshold at 0.5)
+            safety_preds_binary = safety_probs > 0.5
+            
+            # Gate Accuracy
+            gate_accuracy = np.mean(safety_preds_binary == safety_gts)
+            ade_fde["gate_accuracy"] = float(gate_accuracy)
+            
+            # Separate accuracy for safe vs unsafe
+            safe_mask = safety_gts == True
+            unsafe_mask = safety_gts == False
+            
+            if safe_mask.sum() > 0:
+                safe_accuracy = np.mean(safety_preds_binary[safe_mask] == safety_gts[safe_mask])
+                ade_fde["gate_accuracy_safe"] = float(safe_accuracy)
+                ade_fde["gate_num_safe_samples"] = int(safe_mask.sum())
+            
+            if unsafe_mask.sum() > 0:
+                unsafe_accuracy = np.mean(safety_preds_binary[unsafe_mask] == safety_gts[unsafe_mask])
+                ade_fde["gate_accuracy_unsafe"] = float(unsafe_accuracy)
+                ade_fde["gate_num_unsafe_samples"] = int(unsafe_mask.sum())
+            
+            # Mean predicted probability for safe vs unsafe (calibration check)
+            if safe_mask.sum() > 0:
+                ade_fde["gate_mean_prob_for_safe"] = float(np.mean(safety_probs[safe_mask]))
+            if unsafe_mask.sum() > 0:
+                ade_fde["gate_mean_prob_for_unsafe"] = float(np.mean(safety_probs[unsafe_mask]))
+            
+            # AUC-ROC if we have both classes
+            if safe_mask.sum() > 0 and unsafe_mask.sum() > 0:
+                from sklearn.metrics import roc_auc_score
+                try:
+                    auc = roc_auc_score(safety_gts.astype(int), safety_probs)
+                    ade_fde["gate_auc_roc"] = float(auc)
+                except Exception as e:
+                    print(f"Warning: Could not calculate AUC-ROC: {e}")
+            
+            ade_fde["gate_total_samples"] = len(safety_probs)
+            print(f"Gate accuracy: {gate_accuracy:.4f} ({len(safety_probs)} samples)")
+        else:
+            print("No valid safety predictions found for gate accuracy calculation")
     
     return ade_fde
 

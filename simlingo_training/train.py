@@ -26,13 +26,13 @@ def main(cfg: TrainConfig):
     # TEST MODE: Set to True for quick testing with limited batches
     # Set to False for full training run
     TEST_MODE = True  # <--- CHANGE THIS TO False FOR FULL RUN; True for testing
-    TEST_NUM_BATCHES = 30000  # Number of batches for testing
+    TEST_NUM_BATCHES = 10000  # Number of batches for testing
     
     # CRASH MODE: Set to True to finetune on ambiguous crash dataset
-    FINETUNE_CRASH_MODE = True  # <--- Set to True for crash finetuning
+    FINETUNE_CRASH_MODE = False  # <--- Set to True for crash finetuning
     
     # Crash finetuning configuration
-    CRASH_CHECKPOINT = '/home/ubuntu/simlingo/outputs/simlingo/checkpoints/epoch=013.ckpt'
+    CRASH_CHECKPOINT = '/home/lijack/Documents/cs230-final-project/outputs/simlingo/checkpoints/epoch=013.ckpt'
     CRASH_MAX_EPOCHS = 3  # Number of finetuning epochs (starts from 0 since we only load weights, not full checkpoint)
     CRASH_LEARNING_RATE = 1e-5  # Lower LR for finetuning (original: 3e-5)
 
@@ -122,7 +122,11 @@ def main(cfg: TrainConfig):
             state_dict = get_fp32_state_dict_from_zero_checkpoint(cfg.checkpoint)
         else:
             state_dict = torch.load(cfg.checkpoint, map_location="cpu")
-        model.load_state_dict(state_dict)
+            if "state_dict" in state_dict:
+                state_dict = state_dict["state_dict"]
+        # Use strict=False to allow missing keys for new heads (contrastive_head, safety_gate)
+        print("Loading state dict with strict=False to allow new heads initialization")
+        model.load_state_dict(state_dict, strict=False)
 
         
     # print config
@@ -138,6 +142,20 @@ def main(cfg: TrainConfig):
     # resume training
     resume_path = cfg.resume_path
     resume_wandb = False
+    
+    # If starting from a specific checkpoint but not resuming training state (finetuning)
+    if cfg.checkpoint is not None and not cfg.resume:
+        print(f"Loading weights from {cfg.checkpoint} for finetuning (strict=False)")
+        if os.path.isdir(cfg.checkpoint):
+            state_dict = get_fp32_state_dict_from_zero_checkpoint(cfg.checkpoint)
+        else:
+            state_dict = torch.load(cfg.checkpoint, map_location="cpu")
+            if "state_dict" in state_dict:
+                state_dict = state_dict["state_dict"]
+        
+        # Load weights with strict=False to allow missing keys (new heads)
+        model.load_state_dict(state_dict, strict=False)
+        print("Weights loaded successfully.")
 
     # if folder for this experiment does not exist set resume to true
     # to create necessary folders to resume wandb logging later

@@ -150,6 +150,8 @@ class Data_Dreamer(BaseDataset):  # pylint: disable=locally-disabled, invalid-na
         ######################################################
         data = self.load_images(data, images, augment_sample=augment_sample)
         
+        instruction_path = np.array(chosen_option['waypoints'])
+        
         # overwrite action when safety flag is active and action is not allowed
         if activate_safety is not None:
             if activate_safety:
@@ -200,6 +202,9 @@ class Data_Dreamer(BaseDataset):  # pylint: disable=locally-disabled, invalid-na
             placeholder_values = placeholder_values,
             measurement_path = data['measurement_path'],
             dataset = 'driving',
+            safe_to_execute = chosen_option['safe_to_execute'],
+            is_safety_mode = activate_safety if activate_safety is not None else False,
+            instruction_path = instruction_path,
         )
         
         if VIZ_DATA:

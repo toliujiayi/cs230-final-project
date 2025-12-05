@@ -3,7 +3,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-
+from simlingo_training.models.losses import SupConLoss
 from simlingo_training.utils.custom_types import DrivingExample
 
 
@@ -99,6 +99,8 @@ class DrivingAdaptor(nn.Module):
                 mlp_dim=256, 
                 predict_route_as_wps=False, 
                 speed_wps_mode=False,
+                use_contrastive=False,
+                use_consistency=False,
             ):
         super().__init__()
         self.heads = {}
@@ -106,6 +108,28 @@ class DrivingAdaptor(nn.Module):
 
         self.speed_wps_mode = speed_wps_mode
         self.predict_route_as_wps = predict_route_as_wps
+        self.use_contrastive = use_contrastive
+        self.use_consistency = use_consistency
+
+        if use_contrastive:
+            # 1. Contrastive Head
+            self.contrastive_head = nn.Sequential(
+                nn.Linear(hidden_size, 256),
+                nn.ReLU(),
+                nn.Linear(256, 128),
+                # nn.Normalize(dim=-1) # Removed because it is not a Module, implemented in forward or functional
+            )
+            
+            # 2. Safety Gate
+            self.safety_gate = nn.Sequential(
+                nn.Linear(hidden_size, 64),
+                nn.ReLU(),
+                nn.Linear(64, 1),
+                nn.Sigmoid()
+            )
+            
+            # 3. Contrastive Loss
+            self.supcon_loss = SupConLoss(temperature=0.07)
 
         if predict_route_as_wps:
             self.future_waypoints = 20
@@ -163,15 +187,38 @@ class DrivingAdaptor(nn.Module):
     def get_predictions(
         self, 
         features: Tensor,
-        logits: Optional[Tensor] = None
+        logits: Optional[Tensor] = None,
+        is_safety_mode: Optional[Tensor] = None
     ) -> Dict:
 
         current_index = 0
         predictions = {}
+        
+        gated_features = features
+        if self.use_contrastive:
+             # Pool features (mean) -> [B, Hidden]
+             pooled_features = features.mean(dim=1)
+             # Keep in same dtype as features (fp16 if using mixed precision)
+             safety_prob = self.safety_gate(pooled_features)  # [B, 1]
+             
+             predictions['safety_prob'] = safety_prob
+             predictions['raw_features'] = features
+             
+             if is_safety_mode is not None:
+                 # Ensure broadcasting [B, 1, 1] and correct dtype
+                 modulation_mask = is_safety_mode.view(-1, 1, 1).to(dtype=features.dtype, device=features.device)
+                 # We want to modulate ONLY when Unsafe (p_safe low) AND Safety Mode
+                 # F_gated = F * (1 + (1 - p_safe) * mask)
+                 # If Safe (p=1) -> 1 + 0 -> F
+                 # If Unsafe (p=0) + Mask(0) -> 1 + 0 -> F (Instruction Follow)
+                 # If Unsafe (p=0) + Mask(1) -> 1 + 1 -> 2F (Trigger Safe Path)
+                 effective_modulation = 1.0 + ((1.0 - safety_prob.unsqueeze(1)) * modulation_mask)
+                 gated_features = features * effective_modulation
+             
         for i, input_type in enumerate(self.order):
             size = self.sizes[input_type]
 
-            feature = features[:, current_index: current_index + size]
+            feature = gated_features[:, current_index: current_index + size]
             prediction = self.heads[input_type](feature).cumsum(1)
 
             predictions[input_type] = prediction
@@ -198,25 +245,73 @@ class DrivingAdaptor(nn.Module):
         else:
             label_speed_wps = None
 
-        current_index = 0
+        # Get predictions (using gating if enabled)
+        is_safety_mode = getattr(label, 'is_safety_mode', None)
+        predictions = self.get_predictions(adaptor_features, adaptor_logits, is_safety_mode=is_safety_mode)
+
         loss_dict = {}
         for i, input_type in enumerate(self.order):
-            size = self.sizes[input_type]
-            features_tmp = adaptor_features[:, current_index: current_index + size]
-            label = locals()[f'label_{input_type}']
+            label_target = locals()[f'label_{input_type}']
 
-            prediction = self.heads[input_type](features_tmp).cumsum(1)
-            loss = F.smooth_l1_loss(prediction, label, reduction="none").sum(-1)
-            
-            # if input_type == 'waypoints' and self.predict_route_as_wps:
-            #     # compute cross track error
-            #     cte = cross_track_error(prediction, label_waypoints)
-            #     loss_dict[f"{input_type}_cte_loss"] = (cte, torch.ones_like(cte, dtype=torch.long))
+            prediction = predictions[input_type]
+            loss = F.smooth_l1_loss(prediction, label_target, reduction="none").sum(-1)
 
             loss_dict[f"{input_type}_loss"] = (loss, torch.ones_like(loss, dtype=torch.long))
             loss_dict[f"{input_type}_prediction"] = prediction
-            loss_dict[f"{input_type}_label"] = label
-            current_index += size
+            loss_dict[f"{input_type}_label"] = label_target
+
+        if self.use_contrastive:
+            # Contrastive Loss
+            if is_safety_mode is not None:
+                safety_mask = is_safety_mode.bool()
+                if safety_mask.sum() >= 2:
+                    raw_features = predictions['raw_features'][safety_mask] # [B_safe, Q, H]
+                    # Pool and project (keep in native dtype)
+                    embeddings = self.contrastive_head(raw_features.mean(1)) # [B_safe, Dim]
+                    embeddings = F.normalize(embeddings.float(), dim=-1) # Normalize in float32 for numerical stability
+                    
+                    if getattr(label, 'safe_to_execute', None) is not None:
+                        labels_supcon = label.safe_to_execute[safety_mask].float()
+                        
+                        # Check that we have at least one sample of each class (safe and unsafe)
+                        # Otherwise contrastive loss is meaningless (no positive pairs)
+                        num_safe = (labels_supcon == 1).sum()
+                        num_unsafe = (labels_supcon == 0).sum()
+                        
+                        if num_safe >= 1 and num_unsafe >= 1:
+                            # SupCon expects [B, Views, D], we have 1 view
+                            contrastive_loss_val = self.supcon_loss(embeddings.unsqueeze(1), labels_supcon)
+                            # Check for NaN and replace with 0
+                            if not torch.isnan(contrastive_loss_val) and not torch.isinf(contrastive_loss_val):
+                                loss_dict['contrastive_loss'] = (contrastive_loss_val, torch.tensor(1.0, device=embeddings.device))
+            
+            # Gate Loss
+            if 'safety_prob' in predictions and getattr(label, 'safe_to_execute', None) is not None:
+                safety_prob = predictions['safety_prob'].float()  # BCE needs float32
+                gt_safety = label.safe_to_execute.float().unsqueeze(1)
+                gate_loss = F.binary_cross_entropy(safety_prob, gt_safety)
+                loss_dict['gate_loss'] = (gate_loss, torch.tensor(1.0, device=safety_prob.device))
+
+        if self.use_consistency:
+            # Consistency Loss
+             if is_safety_mode is not None and getattr(label, 'safe_to_execute', None) is not None and getattr(label, 'instruction_path', None) is not None:
+                # Unsafe in Safety Mode
+                unsafe_mask = (is_safety_mode.bool() & ~label.safe_to_execute.bool())
+                if unsafe_mask.sum() > 0:
+                    pred_path = predictions['route'][unsafe_mask] # [B_unsafe, N, 2]
+                    instruction_path = label.instruction_path[unsafe_mask] # [B_unsafe, N, 2]
+                    
+                    # Ensure instruction_path is on correct device and dtype
+                    instruction_path = instruction_path.to(device=pred_path.device, dtype=pred_path.dtype)
+
+                    # Distance
+                    # pred_path: [B, N, 2], instruction_path: [B, N, 2] (or matching len)
+                    # Use min length to be safe? Or assume match.
+                    n_pts = min(pred_path.shape[1], instruction_path.shape[1])
+                    dist = torch.norm(pred_path[:, :n_pts] - instruction_path[:, :n_pts], dim=-1).mean(dim=1)
+                    
+                    repulsion = torch.clamp(1.0 - dist, min=0).mean()
+                    loss_dict['consistency_loss'] = (repulsion, torch.tensor(1.0, device=pred_path.device))
 
         return loss_dict
 

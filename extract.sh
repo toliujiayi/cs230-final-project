@@ -4,11 +4,12 @@ i=0
 for file in database/simlingo/*.tar.gz; do
     [ -f "$file" ] || continue
     i=$((i + 1))
-    echo "[$i/$count] Extracting $file to database/simlingo/..."
+    # echo "[$i/$count] Extracting $file to database/simlingo/..."
     if tar -xzf "$file" -C database/simlingo/; then
-        rm -f "$file"
-        echo "[$i/$count] Done and removed $file."
+        # rm -f "$file"
+        echo "[$i/$count] Done with $file."
     else
-        echo "[$i/$count] Failed to extract $file, skipping removal."
+        # rm -f "$file"
+        echo "[$i/$count] Failed to extract $file"
     fi
 done

@@ -1,6 +1,6 @@
 # @package _global_
 defaults:
-  - /data_module: carla_no_buckets #carla_no_buckets #carla_bucket_v12
+  - /data_module: carla_no_buckets
   - /model/vision_model: vlm 
   - /data_module/base_dataset: dataset
 
@@ -8,6 +8,15 @@ model:
   lr: 3e-5
   predict_route_as_wps: True
   speed_wps_mode: 2d
+  use_contrastive: True
+  use_consistency: True
+  loss_weights:
+    contrastive_loss: 0.3     # Increased to force feature separation
+    gate_loss: 1.0            # High weight to ensure gate accuracy
+    consistency_loss: 0.3     # Increased to effectively repel unsafe paths
+    route_loss: 1.0
+    speed_wps_loss: 1.0
+    language_loss: 1.0
   language_model:
     variant: 'OpenGVLab/InternVL2-1B'
     lora: True
@@ -16,11 +25,17 @@ model:
     lora_dropout: 0.1
   vision_model:
     variant: 'OpenGVLab/InternVL2-1B'
+    freeze: True              # Keep vision frozen to preserve perception
 
 data_module:
-  batch_size: 2
+  batch_size: 16              # Critical for contrastive learning (need negatives in batch)
   num_workers: 4
-  # dreamer_dataset: null
+  
+  # Disable driving and QA datasets for crash finetuning
+  driving_dataset: null
+  qa_dataset: null
+  insteval_dataset: null
+  
   base_dataset:
     data_path: database/simlingo
     bucket_path: database/bucketsv2_simlingo
@@ -38,12 +53,12 @@ data_module:
     use_town13: True
 
     use_safety_flag: True
-    # Filter dreamer evaluation by mode (null = all modes, or 'crash', 'lane_change', 'faster', 'slower', 'stop', 'target_speed')
     filter_dreamer_mode: null
+    dreamer_folder: dreamer
 
-max_epochs: 15
+max_epochs: 5
 val_every_n_epochs: 1
 
 gpus: 1
 seed: 42
-name: debug
+name: contrastive_experiment

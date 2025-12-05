@@ -15,6 +15,9 @@ class DatasetOutput(NamedTuple):
     placeholder_values: Optional[Dict]
     measurement_path: Optional[str]
     dataset: Optional[str]
+    safe_to_execute: Optional[bool] = None
+    is_safety_mode: Optional[bool] = None
+    instruction_path: Optional[List[Tuple[float, float]]] = None
     qa_templates: Optional[Tuple[str, str]] = None
     eval_infos: Optional[Dict] = None
 
@@ -55,6 +58,9 @@ class DrivingLabel(NamedTuple):
     path: Tensor 
     answer: LanguageLabel
     image_ff_org: Tensor
+    safe_to_execute: Optional[Tensor] = None
+    is_safety_mode: Optional[Tensor] = None
+    instruction_path: Optional[Tensor] = None
     eval_infos: Optional[Dict] = None
 
 class DrivingExample(NamedTuple):

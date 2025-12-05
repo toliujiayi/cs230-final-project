@@ -82,6 +82,7 @@ class IncrementalPredictionWriter(BasePredictionWriter):
             'routes': self.prediction_dir / f"routes_rank_{self.rank}.jsonl",
             'language': self.prediction_dir / f"language_rank_{self.rank}.jsonl",
             'metadata': self.prediction_dir / f"metadata_rank_{self.rank}.jsonl",
+            'safety': self.prediction_dir / f"safety_rank_{self.rank}.jsonl",  # NEW: safety predictions
         }
         
         # Open file handles
@@ -104,8 +105,15 @@ class IncrementalPredictionWriter(BasePredictionWriter):
         if prediction is None:
             return
         
-        (speed_wps, route, language, speed_wps_gt, route_gt, language_gt, 
-         run_ids, qa_templates, eval_infos, prompts) = prediction
+        # Handle both old format (10 elements) and new format (12 elements with safety)
+        if len(prediction) == 12:
+            (speed_wps, route, language, speed_wps_gt, route_gt, language_gt, 
+             run_ids, qa_templates, eval_infos, prompts, safety_prob, safe_to_execute_gt) = prediction
+        else:
+            (speed_wps, route, language, speed_wps_gt, route_gt, language_gt, 
+             run_ids, qa_templates, eval_infos, prompts) = prediction
+            safety_prob = None
+            safe_to_execute_gt = None
         
         batch_size = len(run_ids)
         
@@ -154,6 +162,30 @@ class IncrementalPredictionWriter(BasePredictionWriter):
                 'eval_info': convert_to_json_serializable(eval_info_value),
             }
             self.file_handles['metadata'].write(json.dumps(metadata) + '\n')
+            
+            # Safety predictions (for contrastive learning evaluation)
+            safety_prob_value = None
+            if safety_prob is not None:
+                if torch.is_tensor(safety_prob):
+                    safety_prob_value = safety_prob[i].item() if safety_prob.dim() > 0 else safety_prob.item()
+                else:
+                    safety_prob_value = safety_prob[i] if hasattr(safety_prob, '__getitem__') else safety_prob
+            
+            safe_gt_value = None
+            if safe_to_execute_gt is not None:
+                if torch.is_tensor(safe_to_execute_gt):
+                    safe_gt_value = safe_to_execute_gt[i].item() if safe_to_execute_gt.dim() > 0 else safe_to_execute_gt.item()
+                else:
+                    safe_gt_value = safe_to_execute_gt[i] if hasattr(safe_to_execute_gt, '__getitem__') else safe_to_execute_gt
+            
+            safety_data = {
+                'run_id': run_ids[i],
+                'batch_idx': batch_idx,
+                'sample_idx': i,
+                'safety_prob': convert_to_json_serializable(safety_prob_value),
+                'safe_to_execute_gt': convert_to_json_serializable(safe_gt_value),
+            }
+            self.file_handles['safety'].write(json.dumps(safety_data) + '\n')
         
         # Flush after each batch to ensure data is written
         for handle in self.file_handles.values():

@@ -327,12 +327,27 @@ class DataModule(LightningDataModule):
                 prompt_inference=prompt_question_languagelabel,
             )
 
+        instruction_paths_list = []
+        for i in range(BS):
+            if data[i].instruction_path is not None:
+                instruction_paths_list.append(data[i].instruction_path)
+            else:
+                 instruction_paths_list.append(data[i].waypoints)
+        
+        instruction_path = torch.tensor(np.asarray(instruction_paths_list)).float()
+
+        safe_to_execute = torch.tensor([d.safe_to_execute if d.safe_to_execute is not None else True for d in data], dtype=torch.bool)
+        is_safety_mode = torch.tensor([d.is_safety_mode if d.is_safety_mode is not None else False for d in data], dtype=torch.bool)
+
         driving_label=DrivingLabel(
                 waypoints=waypoints,
                 path=torch.tensor(np.asarray([data[i].path for i in range(len(data))])).float(), # [B, 3, RH, RW] uint8 [0, 255]
                 answer=answer_label,
                 image_ff_org=image_ff_org,
                 eval_infos=eval_infos,
+                safe_to_execute=safe_to_execute,
+                is_safety_mode=is_safety_mode,
+                instruction_path=instruction_path,
             )
             
         return DrivingExample(
